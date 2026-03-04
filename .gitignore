@@ -1,0 +1,29 @@
+build/bin
+node_modules
+frontend/dist
+frontend/package.json.md5
+.DS_Store
+dbbackup
+
+# Environment & secrets
+.env
+.env.*
+
+# Database files
+*.db
+*.db-journal
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+
+# Logs
+*.log
+
+# Binary
+*.exe

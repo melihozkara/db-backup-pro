@@ -1,0 +1,250 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Disable Windows Defender real-time monitoring
+        run: Set-MpPreference -DisableRealtimeMonitoring $true
+        shell: pwsh
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      - name: Build
+        env:
+          CGO_ENABLED: '1'
+        run: wails build -platform windows/amd64 -tags native_webview2loader
+        timeout-minutes: 20
+
+      - name: Bundle database tools
+        shell: pwsh
+        run: |
+          $toolsDir = "build\bin\tools"
+          $libDir = "$toolsDir\lib"
+          New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $libDir | Out-Null
+
+          # --- MySQL client tools (mysqldump - supports caching_sha2_password) ---
+          try {
+            # GitHub Actions runners have MySQL 8.0+ pre-installed
+            $mysqlBin = Get-ChildItem -Path "C:\Program Files\MySQL\MySQL Server *\bin\mysqldump.exe" -ErrorAction SilentlyContinue | Select-Object -Last 1
+            if ($mysqlBin) {
+              Copy-Item $mysqlBin.FullName -Destination "$toolsDir\mysqldump.exe"
+              $binDir = $mysqlBin.DirectoryName
+              foreach ($dll in @("libcrypto-3-x64.dll", "libssl-3-x64.dll")) {
+                $dllPath = Join-Path $binDir $dll
+                if (Test-Path $dllPath) { Copy-Item $dllPath -Destination "$libDir\" -Force }
+              }
+              Write-Host "mysqldump copied from pre-installed MySQL ($($mysqlBin.FullName))"
+            } else {
+              Write-Host "::warning::MySQL not found on runner, trying download..."
+              $mysqlVer = "8.4.8"
+              $mysqlZip = "mysql-$mysqlVer-winx64.zip"
+              Invoke-WebRequest -Uri "https://cdn.mysql.com/Downloads/MySQL-8.4/$mysqlZip" -OutFile $mysqlZip -UseBasicParsing
+              7z e $mysqlZip -o"$toolsDir" "mysql-$mysqlVer-winx64\bin\mysqldump.exe" -r -y
+              7z e $mysqlZip -o"$libDir" "mysql-$mysqlVer-winx64\bin\libcrypto-3-x64.dll" "mysql-$mysqlVer-winx64\bin\libssl-3-x64.dll" -r -y
+              Remove-Item $mysqlZip -ErrorAction SilentlyContinue
+              Write-Host "mysqldump downloaded from MySQL $mysqlVer"
+            }
+            Write-Host "mysqldump bundled successfully"
+          } catch {
+            Write-Host "::warning::Failed to bundle MySQL tools: $_"
+          }
+
+          # --- PostgreSQL client tools (pg_dump) ---
+          try {
+            $pgVer = "17.4-1"
+            $pgZip = "postgresql-$pgVer-windows-x64-binaries.zip"
+            Write-Host "Downloading PostgreSQL $pgVer..."
+            Invoke-WebRequest -Uri "https://get.enterprisedb.com/postgresql/$pgZip" -OutFile $pgZip -UseBasicParsing
+            7z e $pgZip -o"$toolsDir" "pgsql\bin\pg_dump.exe" -r -y
+            7z e $pgZip -o"$libDir" "pgsql\bin\libpq.dll" "pgsql\bin\libssl-3-x64.dll" "pgsql\bin\libcrypto-3-x64.dll" "pgsql\bin\libintl-9.dll" "pgsql\bin\libiconv-2.dll" -r -y
+            Remove-Item $pgZip -ErrorAction SilentlyContinue
+            Write-Host "pg_dump bundled successfully"
+          } catch {
+            Write-Host "::warning::Failed to download PostgreSQL tools: $_"
+          }
+
+          # --- MongoDB Database Tools (mongodump) ---
+          try {
+            $mongoVer = "100.12.0"
+            $mongoZip = "mongodb-database-tools-windows-x86_64-$mongoVer.zip"
+            Write-Host "Downloading MongoDB Database Tools $mongoVer..."
+            Invoke-WebRequest -Uri "https://fastdl.mongodb.org/tools/db/$mongoZip" -OutFile $mongoZip -UseBasicParsing
+            7z e $mongoZip -o"$toolsDir" "mongodb-database-tools-windows-x86_64-$mongoVer\bin\mongodump.exe" -r -y
+            Remove-Item $mongoZip -ErrorAction SilentlyContinue
+            Write-Host "mongodump bundled successfully"
+          } catch {
+            Write-Host "::warning::Failed to download MongoDB tools: $_"
+          }
+
+          Write-Host "`nBundled tools:"
+          Get-ChildItem -Recurse $toolsDir | ForEach-Object { Write-Host "  $($_.FullName) ($([math]::Round($_.Length/1MB, 1)) MB)" }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbbackup-windows-amd64
+          path: build/bin/
+
+  build-macos:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      - name: Build
+        run: wails build -platform darwin/universal 
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbbackup-macos-universal
+          path: build/bin/*.app
+
+  build-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev build-essential pkg-config
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      - name: Build
+        run: wails build -platform linux/amd64 -tags webkit2_41
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbbackup-linux-amd64
+          path: build/bin/
+
+  create-release:
+    name: Create GitHub Release
+    needs: [build-windows, build-macos, build-linux]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package artifacts
+        run: |
+          cd artifacts
+
+          # Windows - ZIP dosyası oluştur
+          cd dbbackup-windows-amd64
+          zip -r ../dbbackup-windows-amd64.zip .
+          cd ..
+
+          # macOS - ZIP dosyası oluştur
+          cd dbbackup-macos-universal
+          zip -r ../dbbackup-macos-universal.zip *.app
+          cd ..
+
+          # Linux - TAR.GZ dosyası oluştur
+          cd dbbackup-linux-amd64
+          tar -czf ../dbbackup-linux-amd64.tar.gz .
+          cd ..
+
+          ls -lh *.zip *.tar.gz
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/dbbackup-windows-amd64.zip
+            artifacts/dbbackup-macos-universal.zip
+            artifacts/dbbackup-linux-amd64.tar.gz
+          body: |
+            ## 🎉 DB Backup Pro ${{ github.ref_name }}
+
+            ### 📥 İndirme / Download
+
+            **Windows:**
+            - `dbbackup-windows-amd64.zip` - MySQL, PostgreSQL ve MongoDB araçları dahil / Includes MySQL, PostgreSQL and MongoDB tools
+
+            **macOS:**
+            - `dbbackup-macos-universal.zip` - Universal binary (Intel + Apple Silicon)
+            - Gereksinimler / Requirements: `brew install postgresql mysql-client mongodb-database-tools`
+
+            **Linux:**
+            - `dbbackup-linux-amd64.tar.gz`
+            - Gereksinimler / Requirements: `postgresql-client mysql-client mongodb-database-tools`
+
+            ### 📝 Değişiklikler / Changes
+
+            Tüm değişiklikleri görmek için [commit geçmişine](https://github.com/${{ github.repository }}/commits/${{ github.ref_name }}) bakın.
+
+            See [commit history](https://github.com/${{ github.repository }}/commits/${{ github.ref_name }}) for all changes.
+
+            ---
+
+            ⭐ **Projeyi faydalı bulduysanız yıldızlamayı unutmayın! / If you find this project useful, don't forget to star it!**
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
